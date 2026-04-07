@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -250,9 +254,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 self.tokenizer.chat_template = self.config.model.custom_chat_template
 
+        vllm_dtype = PrecisionType.to_dtype(self.config.rollout.dtype)
         torch_dtype = fsdp_config.get("model_dtype", None)
         if torch_dtype is None:
-            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            torch_dtype = torch.float32 if self._is_actor else vllm_dtype
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
@@ -300,7 +305,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if use_liger:
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
 
-                _apply_liger_kernel_to_instance(model=actor_module)
+                _apply_liger_kernel_to_instance(model=actor_module,
+                                                fused_linear_cross_entropy=False) # This flag was in the Precision-RL code, no idea why
 
             fused_kernel_options = self.config.model.get("fused_kernel_options", None)
             fused_kernels_backend = (
@@ -328,6 +334,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "task_type": TaskType.CAUSAL_LM,
                     "r": self.config.model.lora_rank,
                     "lora_alpha": self.config.model.lora_alpha,
+                    "use_rslora": self.config.model.use_rslora,
                     "target_modules": convert_to_regular_types(self.config.model.target_modules),
                     "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
                     "bias": "none",
@@ -347,9 +354,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
             buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
         else:
-            param_dtype = torch.bfloat16
+            param_dtype = PrecisionType.to_dtype(self.config.actor.get("dtype", "float16"))
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
+
+        print(f"param_dtype: {param_dtype}, reduce_dtype: {reduce_dtype}, buffer_dtype: {buffer_dtype}")
 
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
@@ -374,6 +383,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
+        print("use orig params", self.config.actor.fsdp_config.get("use_orig_params", False))
         if fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
                 actor_module,

@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 # Copyright 2022 The HuggingFace Team. All rights reserved.
 #
@@ -26,9 +30,11 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
+from verl.utils.moving_average import ExponentiallyWeightedMovingAverage
 
 POLICY_LOSS_REGISTRY = {}
 
@@ -126,6 +132,9 @@ class AdvantageEstimator(str, Enum):
     OPO = "opo"
     GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
+    FCDPG = "fcdpg"
+    GRPO_UNLKLY="grpo_unlkly"
+    GSPO="gspo"
 
 
 class AdaptiveKLController:
@@ -189,6 +198,143 @@ def get_kl_controller(kl_ctrl):
     else:
         raise NotImplementedError
 
+
+@register_adv_est(AdvantageEstimator.FCDPG)
+def compute_fcdpg_advantage(
+    seq_target_scores: torch.Tensor,
+    seq_policy_scores: torch.Tensor,
+    z: torch.Tensor,
+    loss_divergence: str,
+    use_baseline: bool,
+    index: np.ndarray,
+    alpha: Optional[float],
+    pseudo_reward_clip: Optional[float]
+):
+    """
+    Computes the advantage for f-divergence constrained policy gradient (f-cdpg).
+
+    Args:
+        seq_target_scores: (torch.Tensor) Log-probabilities of the unnormalized target p(x). Shape: (bs).
+        seq_policy_scores: (torch.Tensor) Log-probabilities of the policy π_θ(x). Shape: (bs).
+        z: (torch.Tensor) Partition function estimates for p(x). Shape: (bs).
+        loss_divergence: (str) The type of f-divergence to use ('kl', 'reverse_kl', 'js', 'tv', 'alpha_js').
+        baseline: (Optional[ExponentiallyWeightedMovingAverage]) An optional moving average baseline.
+        alpha: (Optional[float]) The alpha parameter for skewed divergences.
+
+    Returns:
+        advantages: (torch.Tensor) The computed advantages. Shape: (bs, 1).
+        returns: (torch.Tensor) The pseudo-rewards used for baseline updates. Shape: (bs, 1).
+    """
+    assert not seq_policy_scores.requires_grad
+    assert not seq_target_scores.requires_grad
+
+    dtype = seq_policy_scores.dtype
+    device = seq_policy_scores.device
+
+    # Perform calculations only on valid entries to avoid division by zero or log(0)
+    norm_seq_target_scores = seq_target_scores - torch.log(z)
+
+    # The core of the advantage is f'(t) where t = π_θ(x) / p_norm(x)
+    log_t = seq_policy_scores - norm_seq_target_scores
+
+
+    if loss_divergence == "alpha":
+
+        if alpha is None:
+            raise ValueError("Alpha must be provided for alpha divergence.")
+
+        # Limit as α -> 1 is log(t) (Reverse KL)
+        if abs(alpha - 1.0) < 1e-8:
+            f_prime = log_t - 1.0
+        # Limit as α -> 0 is -1/t (KL)
+        elif abs(alpha) < 1e-8:
+            f_prime = -(torch.expm1(-log_t))
+        else:
+            f_prime = -(torch.expm1(log_t * (alpha - 1.0)))
+
+    else:
+        raise NotImplementedError(f"f-divergence '{loss_divergence}' is not supported.")
+
+    pseudo_reward = -f_prime
+
+    if pseudo_reward_clip is not None:
+        pseudo_reward = torch.clamp(pseudo_reward, max=pseudo_reward_clip)
+
+    # Apply baseline if provided
+    if use_baseline:
+        advantage = apply_leave_one_out_baseline(pseudo_reward, index)
+    else:
+        advantage = pseudo_reward
+
+    # Ensure shape is (bs, response_length) for the policy loss function
+    return advantage.unsqueeze(-1), pseudo_reward.unsqueeze(-1)
+
+def apply_leave_one_out_baseline(advantages, index):
+    """
+    Applies a leave-one-out baseline to a set of advantages.
+
+    For each advantage, the baseline is calculated as the mean of all other
+    advantages that share the same index. This ensures that the baseline for
+    a given advantage is not influenced by its own value.
+
+    Args:
+        advantages (torch.Tensor): A 1D tensor of advantages.
+        index (list or torch.Tensor): A list or tensor of indices, where each
+                                      index corresponds to a group for the
+                                      advantages.
+
+    Returns:
+        torch.Tensor: The advantages with the leave-one-out baseline applied.
+    """
+    # Use torch.no_grad() to prevent tracking gradients for this operation
+    with torch.no_grad():
+        # Pre-calculate the sum and count for each group
+        id2sum = defaultdict(float)
+        id2count = defaultdict(int)
+
+        for i in range(advantages.shape[0]):
+            idx = index[i]
+            id2sum[idx] += advantages[i].item()
+            id2count[idx] += 1
+
+        # Apply the leave-one-out baseline
+        baselined_advantages = advantages.clone()
+        for i in range(advantages.shape[0]):
+            idx = index[i]
+
+            total_sum = id2sum[idx]
+            total_count = id2count[idx]
+            current_advantage = advantages[i].item()
+
+            if total_count > 1:
+                # Calculate the mean of all other advantages in the group
+                mean_other_advantages = (total_sum - current_advantage) / (total_count - 1)
+            else:
+                # If there is only one element, there are no "others" to average.
+                # In this case, the baseline is considered zero.
+                mean_other_advantages = 0.0
+
+            # Subtract the leave-one-out mean from the current advantage
+            baselined_advantages[i] -= mean_other_advantages
+
+    return baselined_advantages
+
+def seq_level_scores(
+        token_level_rewards: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        ref_log_prob: torch.Tensor,
+        response_mask: torch.Tensor,
+        exponential_ebm: bool,
+        beta: float):
+    seq_rewards = (token_level_rewards * response_mask).sum(dim=-1)
+    assert (seq_rewards == token_level_rewards.sum(-1)).all()
+    seq_ref_scores = (ref_log_prob  * response_mask).sum(dim=-1)
+    if exponential_ebm:
+        seq_target_scores =  seq_ref_scores + seq_rewards/beta
+    else:
+        seq_target_scores =  seq_ref_scores + torch.log(seq_rewards)
+    seq_policy_scores = (old_log_probs * response_mask).sum(dim=-1)
+    return seq_target_scores, seq_policy_scores, seq_rewards, seq_ref_scores
 
 @register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")
 def compute_gae_advantage_return(
@@ -298,6 +444,7 @@ def compute_grpo_outcome_advantage(
                 id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
+        print("id2mean", id2mean)
         for i in range(bsz):
             if norm_adv_by_std_in_grpo:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
@@ -365,6 +512,78 @@ def compute_grpo_passk_outcome_advantage(
                 std = torch.std(rewards)
                 advantage = advantage / (std + epsilon)
             advantages[i_max] = advantage
+
+    advantages = advantages.unsqueeze(-1) * response_mask
+    return advantages, advantages
+
+
+
+
+@register_adv_est(AdvantageEstimator.GRPO_UNLKLY)  # or simply: @register_adv_est("grpo_unlkly")
+def compute_grpo_unlkly_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for Pass@k using a GRPO-style outcome reward formulation.
+    Apply a rank penality to increase sampling efficiency
+
+    Implemented as described in https://arxiv.org/abs/2506.02355
+
+    Args:
+        token_level_rewards: (bs, response_length)
+        response_mask: (bs, response_length)
+        index: (bs,) → group ID per sample
+        epsilon: float for numerical stability
+        config: (AlgoConfig) algorithm settings, which contains "norm_adv_by_std_in_grpo"
+
+    Returns:
+        advantages: (bs, response_length)
+        returns: (bs, response_length)
+    """
+    assert config is not None
+    # if True, normalize advantage by std within group
+    norm_adv_by_std_in_grpo = config.get("norm_adv_by_std_in_grpo", True)
+    rank_penalty = config.advantage.get("rank_penalty", 0.25)
+    scores = token_level_rewards.sum(dim=-1)  # (bs,)
+    advantages = torch.zeros_like(scores)
+
+    id2scores = defaultdict(list)
+    id2indices = defaultdict(list)
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            idx = index[i]
+            id2scores[idx].append(scores[i])
+            id2indices[idx].append(i)
+
+        for idx in id2scores:
+            rewards = torch.stack(id2scores[idx])  # (k,)
+            indices = id2indices[idx]
+            if rewards.numel() < 2:
+                raise ValueError(
+                    f"Pass@k requires at least 2 samples per group. Got {rewards.numel()} for group {idx}."
+                )
+
+            # Apply rank penalty
+            group_ranks = torch.argsort(torch.argsort(rewards.float()))
+            group_ranks = group_ranks.float() / max(len(rewards) - 1, 1)
+            penalized_rewards = rewards * (1 - group_ranks * rank_penalty)
+
+            group_mean = penalized_rewards.mean()
+            group_std = penalized_rewards.std(unbiased=False)
+
+            for i, global_idx in enumerate(indices):
+                adv = penalized_rewards[i] - group_mean
+                if norm_adv_by_std_in_grpo:
+                    adv = adv / (group_std + epsilon)
+                advantages[global_idx] = adv
 
     advantages = advantages.unsqueeze(-1) * response_mask
     return advantages, advantages
@@ -794,6 +1013,96 @@ def compute_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+
+@register_policy_loss("gspo")
+def compute_policy_loss_gspo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config= None,
+    rollout_log_probs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the clipped policy objective and related metrics for GSPO.
+
+    See https://arxiv.org/pdf/2507.18071 for more details.
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. For GSPO, it is recommended to use "seq-mean-token-mean".
+    """
+
+
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+
+    negative_approx_kl = log_prob - old_log_prob
+
+    # compute sequence-level importance ratio:
+    # si(θ) = (π_θ(yi|x)/π_θold(yi|x))^(1/|yi|) =
+    # exp [(1/|y_i|) * Σ_t log(π_θ(y_i,t|x,y_i,<t)/π_θold(y_i,t|x,y_i,<t))]
+    seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
+    negative_approx_kl_seq = torch.sum(negative_approx_kl * response_mask, dim=-1) / seq_lengths
+
+    # Combined ratio at token level:
+    # s_i,t(θ) = sg[s_i(θ)] · π_θ(y_i,t|x, y_i,<t) / sg[π_θ(y_i,t|x, y_i,<t)]
+    # In log space: log(s_i,t(θ)) = sg[log(s_i(θ))] + log_prob - sg[log_prob]
+    log_seq_importance_ratio = log_prob - log_prob.detach() + negative_approx_kl_seq.detach().unsqueeze(-1)
+    log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)  # clamp for numerical stability
+
+    # finaly exp() to remove log
+    seq_importance_ratio = torch.exp(log_seq_importance_ratio)
+
+    pg_losses1 = -advantages * seq_importance_ratio
+    pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
+
+    # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+@register_policy_loss("fcdpg")
+def compute_policy_loss_fcdpg(old_log_prob, log_prob, advantages, response_mask, loss_agg_mode="seq-mean-token-sum-norm", config=None):
+    """
+    Args:
+        log_prob: `(torch.Tensor)`
+            shape: (bs, response_length)
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+    return:
+        pg_loss: `a scalar torch.Tensor`
+            policy gradient loss computed via GPG
+    """
+    assert not advantages.requires_grad
+    if loss_agg_mode == "seq-mean-token-sum-norm":
+        MAX_TOKENS = 1024
+        pg_loss = (-advantages.mean(dim=-1) * (response_mask * log_prob).sum(dim=-1)).mean() / MAX_TOKENS
+    elif loss_agg_mode == "seq-mean-token-sum":
+        pg_loss = (-advantages.mean(dim=-1) * (response_mask * log_prob).sum(dim=-1)).mean()
+    else:
+        raise RuntimeError(f"Biased agg mode {loss_agg_mode} not supported")
+
+    return pg_loss, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
+
 @register_policy_loss("gpg")
 def compute_policy_loss_gpg(old_log_prob, log_prob, advantages, response_mask, loss_agg_mode="token-mean", config=None):
     """Adapted from
@@ -1012,7 +1321,7 @@ def compute_value_loss(
         response_mask (torch.Tensor):
             Mask indicating which tokens to include in the value loss calculation.
         cliprange_value (float):
-            Clip range for value prediction updates.
+            Clip range for value .
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
 

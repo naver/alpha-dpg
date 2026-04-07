@@ -1,0 +1,34 @@
+# config/scoring.yaml
+
+ray_init:
+  num_cpus: null
+
+# Path to the model, needed for loading the correct tokenizer
+model:
+  path: null
+  trust_remote_code: True
+
+# Configuration for data paths and keys
+data:
+  input_path: null
+  output_path: null
+  prompt_key: "prompt"
+  responses_key: "responses"
+
+# Configuration for the reward model and function
+reward_model:
+  reward_manager: "naive" # Type of reward manager to use
+
+  # (Optional) Define a custom reward function to load dynamically
+  custom_reward_function:
+    path: null
+    name: compute_score
+
+# Configuration for the scoring process
+scoring:
+  # If true, scoring will run in parallel on Ray actors.
+  # If false, it will run synchronously in the main process.
+  launch_reward_fn_async: True
+
+  batch_size: 32
+  num_workers: 8 # Only used if launch_reward_fn_async is true

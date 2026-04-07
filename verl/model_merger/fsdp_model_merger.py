@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +35,18 @@ from tqdm import tqdm
 
 from .base_model_merger import BaseModelMerger
 
+def get_dtype_from_str(dtype_str: str) -> torch.dtype:
+    """Maps a string representation to a torch.dtype."""
+    mapping = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    # .get() allows for a default (float32) if the string is unrecognized
+    return mapping.get(dtype_str.lower(), torch.float32)
 
 class FSDPModelMerger(BaseModelMerger):
     """
@@ -160,13 +176,14 @@ class FSDPModelMerger(BaseModelMerger):
         state_dict = {}
         param_placements: dict[str, list] = {}
 
+        target_dtype = get_dtype_from_str(self.config.dtype)
         for key in set(model_state_dict_lst[0].keys()):
             state_dict[key] = []
             for model_state_shard in model_state_dict_lst:
                 # add tensor shard in order of rank to state_dict[key]
                 tensor = model_state_shard.pop(key)
                 if isinstance(tensor, DTensor):
-                    state_dict[key].append(tensor._local_tensor.bfloat16())
+                    state_dict[key].append(tensor._local_tensor.to(target_dtype))
 
                     placements = tuple(tensor.placements)
                     # replicated placement at dp dimension can be discarded
@@ -178,7 +195,7 @@ class FSDPModelMerger(BaseModelMerger):
                     else:
                         assert param_placements[key] == placements
                 else:
-                    state_dict[key].append(tensor.bfloat16())
+                    state_dict[key].append(tensor.to(target_dtype))
 
         del model_state_dict_lst
 
@@ -229,7 +246,8 @@ class FSDPModelMerger(BaseModelMerger):
     def _validate_state_dict(self, state_dict: dict[str, torch.Tensor]):
         auto_model_class = self.get_transformers_auto_model_class()
 
-        hf_model = auto_model_class.from_pretrained(self.config.test_hf_dir, torch_dtype=torch.bfloat16)
+        target_dtype = get_dtype_from_str(self.config.dtype)
+        hf_model = auto_model_class.from_pretrained(self.config.test_hf_dir, torch_dtype=target_dtype)
         hf_state_dict = hf_model.state_dict()
         del hf_model
 

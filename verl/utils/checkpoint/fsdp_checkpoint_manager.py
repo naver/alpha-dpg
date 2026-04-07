@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -263,10 +267,14 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             local_mkdir_safe(hf_config_tokenizer_path)
             model_config = unwrap_model.config
             if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
-                # Some model's name_or_path is empty if not initialized from pretrained,
-                # in this cases, we don't save generation config.
-                generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
-                generation_config.save_pretrained(hf_config_tokenizer_path)
+                try:
+                    # Some model's name_or_path is empty if not initialized from pretrained,
+                    # in this cases, we don't save generation config.
+                    generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
+                    generation_config.save_pretrained(hf_config_tokenizer_path)
+                except Exception:
+                    generation_config = None
+                    pass
             else:
                 generation_config = None
 

@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,7 +28,7 @@ import torch
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
-
+from scipy.special import comb
 
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
@@ -144,6 +148,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),
         "critic/returns/max": torch.max(valid_returns).detach().item(),
         "critic/returns/min": torch.min(valid_returns).detach().item(),
+        "critic/returns_non_zero/min": torch.min(valid_returns[valid_returns!=0]).detach().item() if (valid_returns != 0).any() else 0,
         **(
             {
                 # values
@@ -424,6 +429,23 @@ def process_validation_metrics(
                                 seed=seed,
                             )
                             metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
+
+                        # New block: pass@k
+                        is_binary_success = set(var_vals) <= {0, 1}
+                        if is_binary_success:
+                            c = sum(var_vals)
+                            for k in ns:
+                                if k > n_resps:
+                                    continue
+                                if c == 0:
+                                    pass_at_k = 0.0
+                                elif c == n_resps:
+                                    pass_at_k = 1.0
+                                else:
+                                    numerator = comb(n_resps - c, k)
+                                    denominator = comb(n_resps, k)
+                                    pass_at_k = 1.0 - numerator / denominator
+                                metric[f"pass@{k}"] = pass_at_k
 
                 data_src2prompt2var2metric[data_source][prompt][var_name] = metric
 

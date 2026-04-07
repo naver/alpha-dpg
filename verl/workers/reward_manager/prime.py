@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2024 PRIME team and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,7 +30,7 @@ from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 
 
-async def single_compute_score(evaluation_func, completion, reference, task, task_extra_info, executor, timeout=300.0):
+async def single_compute_score(evaluation_func, completion, reference, task, task_extra_info, executor, timeout=3600.0):
     loop = asyncio.get_running_loop()
     try:
         # Ensure process_completion is called properly
@@ -52,7 +56,7 @@ async def parallel_compute_score_async(
         try:
             # Create tasks for all rows
             tasks_async = [
-                single_compute_score(evaluation_func, c, r, t, ei, executor, timeout=300.0)
+                single_compute_score(evaluation_func, c, r, t, ei, executor, timeout=3600.0)
                 for c, r, t, ei in zip(completions, references, tasks, extra_info)
             ]
             results = await asyncio.gather(*tasks_async, return_exceptions=False)
@@ -66,7 +70,7 @@ async def parallel_compute_score_async(
                     p = psutil.Process(pid)
                     p.terminate()
                     try:
-                        p.wait(timeout=5)
+                        p.wait(timeout=30)
                     except psutil.TimeoutExpired:
                         p.kill()
                     terminated_count += 1

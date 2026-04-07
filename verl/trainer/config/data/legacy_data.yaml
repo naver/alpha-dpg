@@ -96,3 +96,7 @@ sampler:
 
   # the name of the curriculum class like `MySampler`
   class_name: null
+
+# Dataset fields to convert to tensor
+fields_to_tensor:
+  - partition_function

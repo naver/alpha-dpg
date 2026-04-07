@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 # Copyright 2023-2024 SGLang Team
 # Copyright 2025 ModelBest Inc. and/or its affiliates
@@ -25,6 +29,7 @@ from typing import Tuple
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -37,6 +42,7 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
+import contextlib
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -78,6 +84,11 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        assert self.config.dtype in ["float16", "float32", "bfloat16"]
+        if self.config.dtype == "float16":
+            self.scaler = ShardedGradScaler(growth_interval=400)
+        else:
+            self.scaler = None
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
@@ -99,7 +110,15 @@ class DataParallelPPOActor(BasePPOActor):
                         [inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0
                     )
 
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+        no_autocast = self.config.get("no_autocast", False)
+        if no_autocast:
+            autocast_cm = contextlib.nullcontext()
+        else:
+            from verl.utils.torch_dtypes import PrecisionType
+            torch_dtype = PrecisionType.to_dtype(self.config.dtype)
+            autocast_cm = torch.autocast(device_type=self.device_name, dtype=torch_dtype)
+
+        with autocast_cm:
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
@@ -274,6 +293,8 @@ class DataParallelPPOActor(BasePPOActor):
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
+        if self.scaler is not None:
+            self.scaler.unscale_(self.actor_optimizer)
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):
@@ -281,12 +302,17 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
 
-        # if grad_norm is not finite, skip the update
-        if not torch.isfinite(grad_norm):
-            print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
-            self.actor_optimizer.zero_grad()
+        if self.scaler is not None:
+            self.scaler.step(self.actor_optimizer)
+            self.scaler.update()
         else:
-            self.actor_optimizer.step()
+            # if grad_norm is not finite, skip the update
+            if not torch.isfinite(grad_norm):
+                print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
+                self.actor_optimizer.zero_grad()
+            else:
+                self.actor_optimizer.step()
+
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -494,6 +520,12 @@ class DataParallelPPOActor(BasePPOActor):
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
+                    seq_log_prob = (log_prob.detach() * response_mask).sum(dim=-1)
+                    seq_old_log_prob = (old_log_prob * response_mask).sum(dim=-1)
+                    micro_batch_metrics["actor/policy_prob_discrepancy/max"] = (seq_log_prob - seq_old_log_prob).abs().max().item()
+                    micro_batch_metrics["actor/policy_prob_discrepancy/mean"] = (seq_log_prob - seq_old_log_prob).abs().mean().item()
+                    micro_batch_metrics["actor/policy_prob_discrepancy/min"] = (seq_log_prob - seq_old_log_prob).abs().min().item()
+
                     if self.config.policy_loss.loss_mode == "vanilla":
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                             old_log_prob=old_log_prob,
@@ -513,7 +545,7 @@ class DataParallelPPOActor(BasePPOActor):
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
-                            response_mask=advantages,
+                            response_mask=response_mask,
                             loss_agg_mode=loss_agg_mode,
                             config=self.config,
                         )
@@ -543,7 +575,10 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
-                    loss.backward()
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
                     micro_batch_metrics.update(
                         {

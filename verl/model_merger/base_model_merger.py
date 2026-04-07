@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,6 +42,9 @@ def parse_args():
     base_op_parser = argparse.ArgumentParser(add_help=False)
     base_op_parser.add_argument(
         "--backend", type=str, required=True, choices=["fsdp", "megatron"], help="The backend of the model"
+    )
+    base_op_parser.add_argument(
+        "--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"], help="Data type of the model's weights"
     )
     base_op_parser.add_argument("--local_dir", type=str, default=None, help="Path to the saved model checkpoints.")
     base_op_parser.add_argument(
@@ -83,6 +90,7 @@ def parse_args():
 class ModelMergerConfig:
     operation: str  # 'merge' or 'test'
     backend: str
+    dtype: str
     target_dir: Optional[str] = "tmp"
     hf_upload_path: Optional[str] = None
     private: bool = False
@@ -106,6 +114,7 @@ def generate_config_from_args(args: argparse.Namespace) -> ModelMergerConfig:
     common_config_args = {
         "operation": args.operation,
         "backend": args.backend,
+        "dtype": args.dtype,
         "tie_word_embedding": args.tie_word_embedding,
         "is_value_model": args.is_value_model,
         "local_dir": args.local_dir,

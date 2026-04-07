@@ -67,10 +67,13 @@ actor_rollout_ref:
     # LoRA scaling factor
     lora_alpha: 16
 
+    # Use rank stabilization
+    use_rslora: true
+
     # Target modules to apply LoRA. Options: "all-linear" (not recommended for VLMs) or
     # [q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
     target_modules: all-linear
-    
+
     # Exclude modules from applying Lora. Similar usage to target_modules and Peft.
     # Example: '.*visual.*' for excluding the ViT in Qwen2.5-VL, as currently vllm does not support ViT Lora.
     exclude_modules: null
@@ -449,6 +452,46 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # f-CDPG settings
+  fcdpg:
+
+    # If true, the target distribution is \propto ref_model * exp(reward/kl_coef).
+    # If false, the target disribution is \propto ref_model * reward
+    exponential_ebm: false
+
+    # Divergence to minimize
+    loss_divergence: "amari_alpha"
+
+    # Parameter for Rényi alpha divergence or Skewed JSD
+    alpha: 0.9
+
+    # Whether use a baseline or not
+    use_baseline: true
+
+    # window size for baseline estimation
+    baseline_window_size: 1024
+
+    # window size for divergence estimation
+    divergence_window_size: 8192
+
+    # maximum ratio  p_norm(x) / π_θ(x)
+    ir_max_clip: null
+
+    # maximum -f_prime( π_θ(x) / p_norm(x))
+    pseudo_reward_clip: null
+
+    # maximum value for Z
+    z_max_clip: null
+
+    # whether or not to keep a moving average of z
+    reset_z: false
+
+    # epsilon value to use in case z is 0
+    z_default: 0
+
+    # substract f'(1) from f'(t)
+    center_f: false
+
 # config for the trainer
 trainer:
 
@@ -510,8 +553,8 @@ trainer:
   # Experiment name for run identification in tracking tools
   experiment_name: gsm8k
 
-  # Logging backends to use: "console", "wandb", etc.
-  logger: [ 'console', 'wandb' ]
+  # Logging backends to use: "console", "wandb", etc. trainer.logger='[\"console\",\"mlflow\"]'
+  logger: [ 'console', 'mlflow' ]
 
   # Number of generations to log during validation
   log_val_generations: 0

@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2025 Individual Contributor: Thibaut Barroyer
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,10 +18,9 @@
 
 import multiprocessing
 import os
-from functools import partial
-
+from functools import partial, lru_cache
+from omegaconf import OmegaConf
 import ray
-
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 
@@ -30,6 +33,14 @@ def _call_with_kwargs(raw_fn, extra_kwargs, *args, **kwargs):
     merged_kwargs = {**kwargs, **extra_kwargs}
     return raw_fn(*args, **merged_kwargs)
 
+@lru_cache(maxsize=None)
+def get_cached_reward_fn(config_str: str):
+    """
+    Loads the reward function from a config string. Caching ensures this
+    heavy operation (file I/O, import) happens only once per worker.
+    """
+    config = OmegaConf.create(config_str)
+    return get_custom_reward_fn(config)
 
 def get_custom_reward_fn(config):
     """Load and return a custom reward function from external file.
@@ -159,7 +170,7 @@ def compute_reward(data: DataProto, reward_fn):
     return reward_tensor, reward_extra_infos_dict
 
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=4)
 def compute_reward_async(data: DataProto, config, tokenizer):
     """
     Load the reward manager and compute the reward for a batch of data.

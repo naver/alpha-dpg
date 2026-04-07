@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 # Copyright 2023-2024 SGLang Team
 # Copyright 2025 ModelBest Inc. and/or its affiliates
@@ -26,7 +30,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Optional, Type
+import re
+from typing import Dict, Optional, Type
 
 import numpy as np
 import ray
@@ -60,9 +65,9 @@ from verl.utils.metric import (
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.moving_average import WindowedMovingAverage, MovingAverage, average
 
 WorkerType = Type[Worker]
-
 
 class Role(Enum):
     """
@@ -76,7 +81,6 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
-
 
 @dataclass
 class ResourcePoolManager:
@@ -149,7 +153,6 @@ class ResourcePoolManager:
                     + "cannot be satisfied in this ray cluster"
                 )
 
-
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -192,7 +195,6 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     return data, metrics
 
-
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
@@ -210,7 +212,6 @@ def compute_response_mask(data: DataProto):
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
 
-
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -218,6 +219,7 @@ def compute_advantage(
     lam: float = 1.0,
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
+    use_baseline = False,
     config: Optional[AlgoConfig] = None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
@@ -242,7 +244,20 @@ def compute_advantage(
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
     # prepare response group
-    if adv_estimator == AdvantageEstimator.GAE:
+    if adv_estimator == AdvantageEstimator.FCDPG:
+        advantages, returns = core_algos.compute_fcdpg_advantage(
+            seq_target_scores=data.batch["seq_target_scores"],
+            seq_policy_scores=data.batch["seq_policy_scores"],
+            z = data.batch["z"],
+            loss_divergence = config.fcdpg.loss_divergence,
+            use_baseline = use_baseline,
+            index=data.non_tensor_batch["uid"],
+            alpha=config.fcdpg.alpha,
+            pseudo_reward_clip=config.fcdpg.pseudo_reward_clip
+        )
+        data.batch["advantages"] = advantages.repeat(1, data.batch["response_mask"].shape[-1])
+        data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -290,6 +305,308 @@ def compute_advantage(
         data.batch["returns"] = returns
     return data
 
+def compute_seq_scores(
+    data: DataProto,
+    exponential_ebm: bool,
+    beta: float
+):
+    seq_target_scores, seq_old_log_probs, seq_rewards, seq_ref_scores = core_algos.seq_level_scores(
+        token_level_rewards=data.batch["token_level_rewards"],
+        old_log_probs=data.batch["old_log_probs"],
+        ref_log_prob=data.batch["ref_log_prob"],
+        response_mask=data.batch["response_mask"],
+        exponential_ebm=exponential_ebm,
+        beta=beta
+    )
+    data.batch["seq_target_scores"] = seq_target_scores
+    data.batch["seq_old_log_probs"] = seq_old_log_probs
+    data.batch["seq_rewards"] = seq_rewards
+    data.batch["seq_ref_scores"] = seq_ref_scores
+    if "rollout_log_probs" in data.batch:
+        data.batch["seq_rollout_log_probs"] = (data.batch["rollout_log_probs"] * data.batch["response_mask"]).sum(dim=-1)
+        data.batch["seq_policy_scores"] = data.batch["seq_rollout_log_probs"]
+    else:
+        data.batch["seq_policy_scores"] = data.batch["seq_old_log_probs"]
+    return data
+
+def compute_partition_function(
+    tokenizer,
+    data: DataProto,
+    z: Dict[str, MovingAverage],
+    max_z: float = None,
+    reset_z: bool = False
+):
+    """
+    Computes the partition function using a batch-aware clipping method to
+    avoid bias. Clipping only occurs if the batch's combined estimates would
+    push the moving average over max_z.
+
+    Args:
+        tokenizer: The tokenizer.
+        data: A DataProto object containing batch data.
+        z: A dictionary mapping prompts to MovingAverage objects for z.
+        max_z: If provided, the maximum allowed value for the aggregate z.
+    """
+    # Assertion to not fail silently
+    if "partition_function" in data.batch:
+        print("Using pre-computed partition function")
+
+    if "partition_function" in data.batch:
+        # Partition function pre-computed. Skip computation
+        data.batch["z"] = data.batch["partition_function"]
+        return data, z
+
+    seq_target_scores = data.batch["seq_target_scores"]
+    seq_policy_scores = data.batch["seq_policy_scores"]
+    prompts = data.batch["prompts"]
+
+    # 1. Calculate initial z estimates and create a modifiable copy
+    z_pointwise_estimates = (seq_target_scores - seq_policy_scores).exp()
+    final_z_estimates = z_pointwise_estimates.clone()
+
+    # 2. Group batch indices by prompt to process them together
+    prompt_groups = defaultdict(list)
+    for i, prompt in enumerate(prompts):
+        prompt_groups[prompt_to_key(prompt)].append(i)
+
+    # 3. Reset z if desired
+    if reset_z:
+        for prompt_key in prompt_groups:
+            if prompt_key in z:
+                z[prompt_key].reset()
+
+    if max_z is not None:
+        raise NotImplementedError("max_z is not implemented")
+
+    # 7. Update moving averages and seq_target_scores based on the final z-values
+    for i, prompt in enumerate(prompts):
+        prompt_key = prompt_to_key(prompt)
+        final_z = final_z_estimates[i].item()
+
+        # Update the moving average with the final (potentially clipped) value
+        z[prompt_key].update(final_z)
+
+        # If the value was clipped, update the corresponding target score
+        if final_z != z_pointwise_estimates[i].item():
+            policy_score = seq_policy_scores[i]
+            final_z_tensor = torch.tensor(final_z, device=policy_score.device)
+            new_target_score = policy_score + torch.log(final_z_tensor)
+            seq_target_scores[i] = new_target_score
+
+    # Report the final moving average for each prompt
+    data.batch["z"] = torch.zeros_like(z_pointwise_estimates)
+    for i, prompt in enumerate(prompts):
+        prompt_key = prompt_to_key(prompt)
+        data.batch["z"][i] = z[prompt_key].value
+
+    data.batch["z"] = torch.clamp(data.batch["z"], max=1)
+
+    return data, z
+
+def filter_invalid_sequences(
+    data: DataProto,
+    world_size: int
+) -> DataProto:
+    # First, apply the existing filter for invalid sequences
+    valid_mask = data.batch["z"] != 0
+    data = data[valid_mask]
+
+    # Make sure that the new batch can be split in integer world_size chunks
+    num_valid_elements = len(data)
+    elements_to_keep = (num_valid_elements // world_size) * world_size
+    return data[:elements_to_keep]
+
+def clip_target_probabilities(
+    data: DataProto,
+    ir_max_clip: float
+) -> DataProto:
+    seq_target_scores = data.batch["seq_target_scores"]
+    seq_policy_scores = data.batch["seq_policy_scores"]
+    # clip the target sequence scores so that the importance ratio does not exceed the desired value
+    device = seq_target_scores.device
+    dtype = seq_target_scores.dtype
+    clip_val = torch.log(torch.as_tensor(ir_max_clip, device=device, dtype=dtype))
+    data.batch["seq_target_scores"] = (seq_target_scores - seq_policy_scores).min(clip_val) + seq_policy_scores
+    return data
+
+def prompt_to_key(prompt: torch.Tensor):
+    return tuple(prompt.tolist())
+
+def update_divergence_estimates(data: DataProto, #divergences: defaultdict[str, WindowedMovingAverage]
+                                fcdpg_config):
+    seq_target_scores = data.batch["seq_target_scores"]
+    seq_policy_scores = data.batch["seq_policy_scores"]
+    m1_z = data.batch["z"]
+    divergences = {}
+    for div in ['kl', 'js', 'tv', 'alpha']:
+        pointwise_estimates = divergence_pointwise_estimates(
+            m1_log_scores=seq_target_scores,
+            m2_log_scores=seq_policy_scores,
+            m1_z=m1_z,
+            div=div,
+            fcdpg_config=fcdpg_config
+        )
+        divergences[div] = pointwise_estimates.mean()
+    return divergences
+
+def estimate_ess(data: DataProto):
+    norm_seq_target_scores = data.batch["seq_target_scores"] - torch.log(data.batch["z"])
+    seq_policy_scores = data.batch["seq_policy_scores"]
+    importance_ratios = torch.exp(norm_seq_target_scores - seq_policy_scores)
+    return (importance_ratios.sum().square() / importance_ratios.square().sum()).item()
+
+def report_likelihood_ratios(data: DataProto):
+    norm_seq_target_scores = data.batch["seq_target_scores"] - torch.log(data.batch["z"])
+    seq_policy_scores = data.batch["seq_policy_scores"]
+    support = ~torch.isneginf(norm_seq_target_scores)
+    likelihood_ratios = torch.exp(norm_seq_target_scores - seq_policy_scores)
+    truncated_ratios = torch.clamp(likelihood_ratios, max=1)
+    excess_mass_estimators = (1 - truncated_ratios)
+    lacking_mass_estimators = (likelihood_ratios - truncated_ratios)
+    return {
+        "critic/policy_mass/in_support_excess" : excess_mass_estimators[support].mean(),
+        "critic/policy_mass/in_support_lacking" : lacking_mass_estimators[support].mean(),
+        "critic/policy_mass/in_support_diff" : excess_mass_estimators[support].mean() - lacking_mass_estimators[support].mean() ,
+        "critic/likelihood_ratios/mean": likelihood_ratios.mean().item(),
+        "critic/likelihood_ratios/min_non_zero": likelihood_ratios[support].min().item() if support.any() else 0,
+        "critic/likelihood_ratios/min": likelihood_ratios.min().item(),
+        "critic/likelihood_ratios/max": likelihood_ratios.max().item(),
+        "critic/likelihood_ratios/count_correct_diff": (likelihood_ratios[support] >= 1).sum().item() - (likelihood_ratios[support] < 1).sum().item(),
+        "critic/likelihood_ratios/count_correct": support.sum().item()
+    }
+
+def report_advantages_by_support(data: DataProto):
+    advantages = data.batch["advantages"]
+    seq_target_scores = data.batch["seq_target_scores"]
+    in_support = ~torch.isneginf(seq_target_scores)
+    n = len(data.batch)
+    advantage_in_support = advantages[in_support].sum() / n
+    advantage_out_support = advantages[~in_support].sum() / n
+    return {
+        "critic/advantage_in_support": advantage_in_support,
+        "critic/advantage_out_support": advantage_out_support,
+    }
+
+def divergence_pointwise_estimates(
+    m1_log_scores: torch.Tensor,
+    m2_log_scores: torch.Tensor,
+    m1_z: torch.Tensor,  # log-partition function for m1 (p)
+    proposal_log_scores: Optional[torch.Tensor] = None, # Unused, kept for signature
+    div: str = "kl",
+    fcdpg_config=None # Used for alpha-divergence
+) -> torch.Tensor:
+    """
+    Calculates pointwise f-divergence estimates based on the formula:
+    D_f(p1 || p2) = E_p2[ f(p1(x) / p2(x)) ]
+
+    Based on the prompt, we are calculating D_f(m2 || m1)
+    (where p1 = m2 = pi_theta, p2 = m1 = p).
+    The formula is: D_f(m2 || m1) = E_m1[ f(m2(x) / m1(x)) ]
+
+    This implies samples are drawn from m1 (p).
+    The pointwise estimate is the term inside the expectation: f(r)
+    where r = m2(x) / m1(x).
+
+    Args:
+        m1_log_scores: torch.Tensor, log-probabilities from model 1 (p).
+        m2_log_scores: torch.Tensor, log-probabilities from model 2 (pi_theta).
+                       Assumes samples are drawn from m1 (p).
+        m1_z: torch.Tensor, log-partition function for m1 (p).
+        proposal_log_scores: Unused argument, kept for API compatibility.
+        div: String identifier for the divergence type.
+        fcdpg_config: Configuration object, expected to have an 'alpha'
+                      attribute if div == 'alpha'.
+
+    Returns:
+        torch.Tensor: A tensor of pointwise f(r) estimates.
+    """
+
+    # Calculate the log-ratio and ratio
+    # r = m2(x) / m1(x)
+    # log_r = log(m2(x)) - log_m1_normalized(x)
+    # where log_m1_normalized(x) = m1_log_scores(x) - m1_z
+    assert (m1_z > 0).all()
+    log_m1_normalized = m1_log_scores - m1_z.log()
+    log_r = m2_log_scores - log_m1_normalized
+
+    # we are using importance sampling estimates of m1 to estimate the divergence
+    # following Eq 6 in https://arxiv.org/abs/2302.08215
+    importance_weights = torch.exp(-log_r)
+
+    support = ~torch.isneginf(m1_log_scores)
+
+    r = torch.exp(log_r)
+
+    # Ensure tensor operations are on the same device
+    device = r.device
+
+    if div == "kl":
+        # "Forward KL": D_KL(m1 || m2)
+        estimates = -log_r
+        f_prime_inf = 0
+
+    elif div == "rkl":
+        # "Reverse KL": D_KL(m2 || m1)
+        # We use torch.xlogy(x, y) = x * log(y) which handles x=0 correctly (0 * log(0) = 0)
+        estimates = torch.xlogy(r, r)
+        f_prime_inf = float("inf")
+
+    elif div == "js":
+        # "Jensen-Shannon": JS(m1 || m2)
+        # f(t) = (t+1)log(2) + t*log(t) - (t+1)*log(t+1)
+
+        log_2 = torch.log(torch.tensor(2.0, device=device))
+        r_plus_1 = r + 1.0
+
+        # t*log(t) -> r*log(r)
+        term1_safe = torch.xlogy(r, r)
+        # (t+1)*log(t+1) -> (r+1)*log(r+1)
+        term2_safe = torch.xlogy(r_plus_1, r_plus_1)
+
+        estimates = (r_plus_1 * log_2) + term1_safe - term2_safe
+        f_prime_inf = torch.log(torch.tensor(2.0))
+
+    elif div == "tv":
+        # "Total Variation": TV(m1, m2)
+        estimates = 0.5 * torch.abs(1.0 - r)
+        f_prime_inf = 0.5
+
+    elif div == "alpha":
+        # "Alpha-Divergence"
+        if fcdpg_config is None or not hasattr(fcdpg_config, 'alpha'):
+            raise ValueError("alpha divergence requires fcdpg_config with 'alpha' attribute")
+
+        alpha = fcdpg_config.alpha
+
+        if alpha == 1.0:
+            # Limit as alpha -> 1 (Reverse KL)
+            # f(t) = t log t - t + 1
+            estimates = torch.xlogy(r, r) - r + 1.0
+        elif alpha == 0.0:
+            # Limit as alpha -> 0 (Forward KL)
+            # f(t) = -log t + t - 1
+            estimates = -log_r + r - 1.0
+        else:
+            # General alpha-divergence
+            # f(t) = (t^alpha - alpha*t - (1-alpha)) / (alpha * (alpha - 1))
+            numerator = torch.pow(r, alpha) - alpha * r - (1.0 - alpha)
+            denominator = alpha * (alpha - 1.0)
+            estimates = numerator / denominator
+
+        f_prime_inf = 1 / (1 - alpha)
+
+    else:
+        raise NotImplementedError(f"Divergence '{div}' not implemented.")
+
+    estimates[~support] = f_prime_inf
+    estimates[support] *= importance_weights[support]
+
+    return estimates
+
+def update_baseline(data: DataProto, baseline: WindowedMovingAverage):
+    rewards = data.batch["returns"]
+    baseline.update(rewards)
+    return baseline
 
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
@@ -371,12 +688,14 @@ class RayPPOTrainer:
         elif self.config.algorithm.adv_estimator in [
             AdvantageEstimator.GRPO,
             AdvantageEstimator.GRPO_PASSK,
+            AdvantageEstimator.GRPO_UNLKLY,
             AdvantageEstimator.REINFORCE_PLUS_PLUS,
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.OPO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
             AdvantageEstimator.GPG,
+            AdvantageEstimator.FCDPG,
         ]:
             self.use_critic = False
         else:
@@ -1084,6 +1403,7 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+        total_samples = 0
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1106,6 +1426,13 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
+        baseline = None
+        if self.config.algorithm.adv_estimator == AdvantageEstimator.FCDPG:
+            z = defaultdict(MovingAverage)
+
+        seq_entropy = WindowedMovingAverage(
+            window_size=self.config.algorithm.fcdpg.divergence_window_size
+        )
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 do_profile = (
@@ -1149,6 +1476,7 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                gen_batch_no_rollout = deepcopy(gen_batch)
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -1160,12 +1488,13 @@ class RayPPOTrainer:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
+                            gen_baseline_batch = gen_batch_no_rollout
                             gen_baseline_batch.meta_info["do_sample"] = False
                             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
@@ -1240,9 +1569,22 @@ class RayPPOTrainer:
                             rollout_probs_diff_std = torch.std(rollout_probs_diff)
                             metrics.update(
                                 {
-                                    "training/rollout_probs_diff_max": rollout_probs_diff_max.detach().item(),
-                                    "training/rollout_probs_diff_mean": rollout_probs_diff_mean.detach().item(),
-                                    "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
+                                    "training/rollout_probs_diff/max": rollout_probs_diff_max.detach().item(),
+                                    "training/rollout_probs_diff/mean": rollout_probs_diff_mean.detach().item(),
+                                    "training/rollout_probs_diff/std": rollout_probs_diff_std.detach().item(),
+                                }
+                            )
+                            rollout_log_probs_diff = torch.abs(rollout_old_log_probs - actor_old_log_probs)
+                            rollout_log_probs_diff = torch.masked_select(rollout_log_probs_diff, response_mask.bool())
+                            rollout_log_probs_diff_max = torch.max(rollout_log_probs_diff)
+                            rollout_log_probs_diff_mean = torch.mean(rollout_log_probs_diff)
+                            rollout_log_probs_diff_std = torch.std(rollout_log_probs_diff)
+                            metrics.update(
+                                {
+                                    "training/rollout_log_probs_diff/mean": torch.masked_select(rollout_old_log_probs - actor_old_log_probs, response_mask.bool()).mean().detach().item(),
+                                    "training/rollout_log_probs_diff_abs/max": rollout_log_probs_diff_max.detach().item(),
+                                    "training/rollout_log_probs_diff_abs/mean": rollout_log_probs_diff_mean.detach().item(),
+                                    "training/rollout_log_probs_diff_abs/std": rollout_log_probs_diff_std.detach().item(),
                                 }
                             )
 
@@ -1286,6 +1628,65 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.FCDPG:
+                            # Compute the target and policy seq-level scores
+                            batch = compute_seq_scores(batch, exponential_ebm=self.config.algorithm.fcdpg.exponential_ebm, beta=self.config.algorithm.kl_ctrl.kl_coef)
+                            if "rollout_log_probs" in batch.batch:
+                                print("rollout log probs", batch.batch["rollout_log_probs"].dtype)
+                                print("old log probs", batch.batch["old_log_probs"].dtype)
+                                print("ref log probs", batch.batch["ref_log_prob"].dtype)
+                                if "seq_rollout_log_probs" in batch.batch:
+                                    seq_rollout_log_probs_diff = batch.batch["seq_rollout_log_probs"] - batch.batch["seq_old_log_probs"]
+                                    seq_rollout_log_probs_diff_abs = seq_rollout_log_probs_diff.abs()
+                                    metrics["training/seq_rollout_probs_diff/mean"] = seq_rollout_log_probs_diff.mean().item()
+                                    metrics["training/seq_rollout_probs_diff/std"] = seq_rollout_log_probs_diff.mean().item()
+                                    metrics["training/seq_rollout_probs_diff/min"] = seq_rollout_log_probs_diff.min().item()
+                                    metrics["training/seq_rollout_probs_diff/max"] = seq_rollout_log_probs_diff.max().item()
+                                    metrics["training/seq_rollout_probs_diff_abs/mean"] = seq_rollout_log_probs_diff_abs.mean().item()
+                                    metrics["training/seq_rollout_probs_diff_abs/min"] = seq_rollout_log_probs_diff_abs.min().item()
+                                    metrics["training/seq_rollout_probs_diff_abs/max"] = seq_rollout_log_probs_diff_abs.max().item()
+                                # Report divergence from reference
+                                diff_ref_scores = ((batch.batch['old_log_probs'] - batch.batch['ref_log_prob']) * batch.batch['response_mask'])
+                                diff_ref_scores_flat = torch.masked_select(diff_ref_scores, batch.batch["response_mask"].bool())
+                                metrics['training/diff_ref/mean'] = diff_ref_scores_flat.mean().item()
+                                metrics['training/diff_ref/std'] = diff_ref_scores_flat.std().item()
+                                metrics['training/diff_ref/min'] = diff_ref_scores_flat.min().item()
+                                metrics['training/diff_ref/max'] = diff_ref_scores_flat.max().item()
+                                diff_ref_scores_abs = diff_ref_scores.abs()
+                                metrics['training/diff_ref_abs/mean'] = torch.masked_select(diff_ref_scores_abs, batch.batch['response_mask'].bool()).mean().item()
+                                metrics['training/diff_ref_abs/min'] = diff_ref_scores_abs.min().item()
+                                metrics['training/diff_ref_abs/max'] = diff_ref_scores_abs.max().item()
+                                seq_diff_ref_scores = diff_ref_scores.sum(dim=-1)
+                                metrics['training/seq_diff_ref/mean'] = torch.mean(seq_diff_ref_scores).item()
+                                metrics['training/seq_diff_ref/std'] = torch.std(seq_diff_ref_scores).item()
+                                metrics['training/seq_diff_ref/min'] = torch.min(seq_diff_ref_scores).item()
+                                metrics['training/seq_diff_ref/max'] = torch.max(seq_diff_ref_scores).item()
+                                seq_diff_ref_scores_abs = seq_diff_ref_scores.abs()
+                                metrics['training/seq_diff_ref_abs/mean'] = torch.mean(seq_diff_ref_scores_abs).item()
+                                metrics['training/seq_diff_ref_abs/min'] = torch.min(seq_diff_ref_scores_abs).item()
+                                metrics['training/seq_diff_ref_abs/max'] = torch.max(seq_diff_ref_scores_abs).item()
+                            # Clip target probabilities
+                            if self.config.algorithm.fcdpg.ir_max_clip:
+                                batch = clip_target_probabilities(batch, ir_max_clip=self.config.algorithm.fcdpg.ir_max_clip)
+                            # Compute the partition function
+                            batch, z = compute_partition_function(
+                                self.tokenizer, batch, z, self.config.algorithm.fcdpg.z_max_clip, self.config.algorithm.fcdpg.reset_z
+                            )
+                            metrics['critic/z/mean'] = torch.mean(batch.batch['z']).item()
+                            metrics['critic/z/min'] = torch.min(batch.batch['z']).item()
+                            metrics['critic/z/max'] = torch.max(batch.batch['z']).item()
+                            # report the reward of the complete batch before filter
+                            sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+                            metrics["critic/full_rewards/mean"] = torch.mean(sequence_reward).detach().item()
+                            # Remove sequences where the partition function is null
+                            # batch = filter_invalid_sequences(batch, self.actor_rollout_wg.world_size)
+                            invalid_mask = batch.batch["z"] == 0
+                            batch.batch["z"][invalid_mask] = batch.batch["z"][invalid_mask] + self.config.algorithm.fcdpg.z_default
+                            metrics['training/effective_batch_size'] = batch.batch.batch_size[0]
+                            if batch.batch.batch_size[0] == 0:
+                                # No valid sequences in this batch, try again
+                                continue
+
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1293,8 +1694,21 @@ class RayPPOTrainer:
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            use_baseline=self.config.algorithm.fcdpg.use_baseline,
                             config=self.config.algorithm,
                         )
+
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.FCDPG and baseline:
+                            baseline = update_baseline(data=batch, baseline=baseline)
+                            metrics.update({"critic/baseline": baseline.value})
+
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.FCDPG:
+                            if self.config.algorithm.fcdpg.pseudo_reward_clip is not None:
+                                num_clipped = (batch.batch["returns"] == self.config.algorithm.fcdpg.pseudo_reward_clip).sum()
+                            else:
+                                num_clipped = 0
+                            metrics.update({"critic/clipped_pseudo_rewards": num_clipped})
+
 
                     # update critic
                     if self.use_critic:
@@ -1374,6 +1788,17 @@ class RayPPOTrainer:
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                if self.config.algorithm.adv_estimator == AdvantageEstimator.FCDPG:
+                    divergences = update_divergence_estimates(data=batch, fcdpg_config=self.config.algorithm.fcdpg)
+                    metrics.update({"critic/divergence/" + div: estimate for (div, estimate) in divergences.items()}) #estimate.value for (div, estimate) in divergences.items() if estimate.value is not None})
+                    ref_reverse_kl = (batch.batch["seq_old_log_probs"] - batch.batch["seq_ref_scores"]).mean()
+                    metrics.update({"critic/ref_reverse_kl": ref_reverse_kl})
+                    ess = estimate_ess(data=batch)
+                    metrics.update({"critic/ess": ess})
+                    metrics.update(report_likelihood_ratios(data=batch))
+                    metrics.update(report_advantages_by_support(data=batch))
+                seq_entropy.update(-(batch.batch["old_log_probs"] * batch.batch["response_mask"]).sum(dim=-1))
+                metrics.update({'critic/seq_entropy': seq_entropy.value})
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
@@ -1381,6 +1806,9 @@ class RayPPOTrainer:
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
+
+                total_samples +=  len(batch.batch["responses"])
+                metrics.update({'training/total_samples': total_samples})
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

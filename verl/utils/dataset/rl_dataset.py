@@ -1,3 +1,7 @@
+# alpha-dpg
+# Modified by Copyright (C) 2026 Naver Corporation. All rights reserved.
+
+# Original work
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 # Copyright 2023-2024 SGLang Team
 # Copyright 2025 ModelBest Inc. and/or its affiliates
@@ -18,6 +22,7 @@ import copy
 import logging
 import os
 import re
+import torch
 from collections import defaultdict
 from typing import List, Optional, Union
 
@@ -116,6 +121,8 @@ class RLHFDataset(Dataset):
         self.filter_prompts = config.get("filter_prompts", True)
         self.serialize_dataset = False
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
+
+        self.fields_to_tensor = config.get("fields_to_tensor", [])
 
         self._download()
         self._read_files_and_tokenize()
@@ -325,6 +332,18 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+
+        for field in self.fields_to_tensor:
+            if field in row_dict and row_dict[field] is not None:
+                try:
+                    # Using as_tensor avoids data copies if already a tensor or numpy array
+                    row_dict[field] = torch.as_tensor(row_dict[field])
+                except (TypeError, ValueError) as e:
+                    logger.warning(
+                        "Could not convert field '{}' to a tensor for index {}. "
+                        "Value: {}. Error: {}", field, index, row_dict[field], e
+                    )
+
         return row_dict
 
     def __getstate__(self):
